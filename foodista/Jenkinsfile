@@ -1,0 +1,126 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_CREDENTIALS_ID = 'docker-cred'
+        DOCKER_IMAGE          = 'adhil6407/foodista'
+        SONAR_SERVER_NAME     = 'sonarqube_env'
+        SONAR_SCANNER_TOOL    = 'sonar-scanner'
+        GIT_CREDENTIALS_ID    = 'github-cred'
+        MANIFEST_REPO         = 'https://github.com/adhil6407/foodista-pipeline.git'
+        MANIFEST_BRANCH       = 'main'
+    }
+
+    stages {
+
+        stage('Checkout Source Code') {
+            steps {
+                echo "passed"
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    def scannerHome = tool "${SONAR_SCANNER_TOOL}"
+
+                    withSonarQubeEnv("${SONAR_SERVER_NAME}") {
+                        sh "${scannerHome}/bin/sonar-scanner \
+                            -Dsonar.projectKey=foodista-key \
+                            -Dsonar.projectName='foodista-project' \
+                            -Dsonar.sources=."
+                    }
+                }
+            }
+        }
+
+        stage('Build & Post Docker Image') {
+            steps {
+                script {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: "${DOCKER_CREDENTIALS_ID}",
+                            usernameVariable: 'DOCKER_USER',
+                            passwordVariable: 'DOCKER_PASS'
+                        )
+                    ]) {
+
+                        sh """
+                            echo "\$DOCKER_PASS" | docker login -u "\$DOCKER_USER" --password-stdin
+
+                            docker build \
+                                -t ${DOCKER_IMAGE}:${env.BUILD_NUMBER} \
+                                -t ${DOCKER_IMAGE}:latest \
+                                -f foodista/Dockerfile foodista
+
+                            docker push ${DOCKER_IMAGE}:${env.BUILD_NUMBER}
+                            docker push ${DOCKER_IMAGE}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Update Manifest Repo') {
+            steps {
+                script {
+
+                    dir('manifest-workspace') {
+
+                        withCredentials([
+                            usernamePassword(
+                                credentialsId: "${GIT_CREDENTIALS_ID}",
+                                usernameVariable: 'GH_USER',
+                                passwordVariable: 'GH_TOKEN'
+                            )
+                        ]) {
+
+                            sh """
+                                echo "Cloning manifest repository..."
+
+                                rm -rf ./* ./.git
+
+                                git clone \
+                                    https://\${GH_USER}:\${GH_TOKEN}@github.com/adhil6407/foodista-pipeline.git \
+                                    .
+
+                                git checkout ${MANIFEST_BRANCH}
+
+                                echo "Manifest repository contents:"
+                                ls -la
+
+                                echo "Searching for deployment.yaml:"
+                                find . -name deployment.yaml
+
+                                sed -i '/name: foodista/{n;s|image:.*|image: ${DOCKER_IMAGE}:${env.BUILD_NUMBER}|}' \
+                                    foodista/manifests/deployment.yaml
+
+                                git config user.name "adhil6407"
+                                git config user.email "adhilzaed@gmail.com"
+
+                                git add foodista/manifests/deployment.yaml
+
+                                git commit \
+                                    -m "chore(manifest): update foodista image tag to ${env.BUILD_NUMBER} [skip ci]" \
+                                    || echo "No changes to commit"
+
+                                git push origin ${MANIFEST_BRANCH}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo 'Pipeline executed successfully! Manifest repo updated with new image tag.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Please review the stage logs above.'
+        }
+    }
+}
